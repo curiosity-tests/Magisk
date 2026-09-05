@@ -1,6 +1,40 @@
 name: Magisk Build
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch gains leg/profile/racecar_run inputs so racecar can pick
+#      the baseline vs instrumented arm (upstream's bare workflow_dispatch had no
+#      way to express it).
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together (the internal pattern, cf. dummy-deployments).
+#   3. permissions: id-token: write for the action's OIDC connect. Declaring the
+#      block zeroes every unlisted scope, so contents: read is restated.
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. Non-Linux legs removed, because observables are linux-only:
+#        - `build` ran on macos-26 (the asset build),
+#        - `test-build`'s matrix dropped windows-2025, leaving ubuntu-24.04.
+#      `avd-test`, `avd-test-32` and `cf-test` consumed `build`'s uploaded
+#      artifacts via `needs: build`; with the macOS producer gone they can never
+#      run, and a dangling `needs` is a workflow syntax error, so they are
+#      removed too. (`cf-test` was already `if: false` upstream.) What remains is
+#      the one Linux leg upstream actually has: the full NDK/Gradle build.
+# Build and test COMMANDS are byte-identical to upstream.
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
     branches: [master]
     paths:
@@ -10,60 +44,48 @@ on:
       - ".github/workflows/build.yml"
   pull_request:
     branches: [master]
-  workflow_dispatch:
+
+run-name: "Magisk Build ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
-  build:
-    name: Build Magisk artifacts
-    runs-on: macos-26
-    strategy:
-      fail-fast: false
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-        with:
-          submodules: "recursive"
-
-      - name: Setup environment
-        uses: ./.github/actions/setup
-        with:
-          is-asset-build: true
-
-      - name: Build release
-        run: ./build.py -vr all
-
-      - name: Build debug
-        run: ./build.py -v all
-
-      - name: Stop gradle daemon
-        run: ./app/gradlew --stop
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ github.sha }}
-          path: out
-          compression-level: 9
-
-      - name: Upload mapping and native debug symbols
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ github.sha }}-symbols
-          path: app/apk/build/outputs
-          compression-level: 9
-
   test-build:
     name: Test building on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2025, ubuntu-24.04]
+        os: [ubuntu-24.04]
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: crashappsec/action-checkout@main
         with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          # Default is best-effort; a silently-uninstrumented run is a corrupt
+          # data point rather than a degraded one, so fail closed.
+          observables_continue_on_error: false
+          # Upstream used actions/checkout, which does not fetch LFS.
+          lfs: false
           submodules: "recursive"
+
+      # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
+      # clears LD_PRELOAD once it has injected, so an empty LD_PRELOAD inside the
+      # shell is what SUCCESS looks like. pgrep is no good either -- co-hostd
+      # daemonizes under another name.
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Setup environment
         uses: ./.github/actions/setup
@@ -73,124 +95,3 @@ jobs:
 
       - name: Stop gradle daemon
         run: ./app/gradlew --stop
-
-  avd-test:
-    name: Test API ${{ matrix.version }} (x86_64)
-    runs-on: ubuntu-24.04
-    needs: build
-    if: ${{ github.event_name != 'push' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        version: [23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 36.1, "37.0"]
-        type: [""]
-        include:
-          - version: "CANARY"
-            type: "google_apis_ps16k"
-
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ github.sha }}
-          path: out
-
-      - name: Enable KVM group perms
-        run: .github/kvm.sh
-
-      - name: Run AVD test
-        timeout-minutes: 18
-        run: scripts/avd.sh test -l -v ${{ matrix.version }} -t "${{ matrix.type }}"
-
-      - name: Upload logs on error
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: "avd-logs-${{ matrix.version }}"
-          path: |
-            kernel.log
-            logcat.log
-
-  avd-test-32:
-    name: Test API ${{ matrix.version }} (x86)
-    runs-on: ubuntu-24.04
-    needs: build
-    if: ${{ github.event_name != 'push' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        version: [23, 26, 28, 30]
-
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ github.sha }}
-          path: out
-
-      - name: Enable KVM group perms
-        run: .github/kvm.sh
-
-      - name: Run AVD test
-        timeout-minutes: 18
-        run: scripts/avd.sh test -l -a x86 -v ${{ matrix.version }}
-
-      - name: Upload logs on error
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: "avd32-logs-${{ matrix.version }}"
-          path: |
-            kernel.log
-            logcat.log
-
-  cf-test:
-    name: Test ${{ matrix.device }}
-    runs-on: ubuntu-24.04
-    needs: build
-    if: false
-    env:
-      CF_HOME: /home/runner/aosp_cf_phone
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - branch: "aosp-android-latest-release"
-            device: "aosp_cf_x86_64_only_phone"
-
-    steps:
-      - name: Check out
-        uses: actions/checkout@v6
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ github.sha }}
-          path: out
-
-      - name: Enable KVM group perms
-        run: .github/kvm.sh
-
-      - name: Setup Cuttlefish environment
-        run: |
-          scripts/cuttlefish.sh setup
-          scripts/cuttlefish.sh download ${{ matrix.branch }} ${{ matrix.device }}
-
-      - name: Run Cuttlefish test
-        timeout-minutes: 18
-        run: sudo -E -u $USER scripts/cuttlefish.sh test
-
-      - name: Upload logs on error
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: "cvd-logs-${{ matrix.device }}"
-          path: |
-            /home/runner/aosp_cf_phone/cuttlefish/instances/cvd-1/logs
-            /home/runner/aosp_cf_phone/cuttlefish/instances/cvd-1/cuttlefish_config.json
